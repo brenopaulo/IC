@@ -1,0 +1,91 @@
+# Instalação das principais bibliotecas necessárias
+
+!pip install -q langchain chromadb langchain_community langchain-text-splitters langchain-core faiss-cpu langchain_huggingface langchain-google-genai pypdf
+
+import requests
+import uuid
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+
+from google.colab import userdata
+key = userdata.get('GeminiAPIKey') #adiciona a API key do Gemini
+
+# BAIXANDO E LENDO O PDF
+url = "https://www.confea.org.br/midias/uploads-imce/codigo_etica_profissional_versao-digital.pdf"
+arquivo_local = "codigo_etica.pdf"
+
+# Baixa o PDF da internet e salva temporariamente no Colab
+resposta = requests.get(url)
+with open(arquivo_local, 'wb') as f:
+    f.write(resposta.content)
+
+# O LangChain extrai todo o texto do PDF
+carregador = PyPDFLoader(arquivo_local)
+documentos = carregador.load()
+
+# Chunking (Segmentação)
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=2000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", ".", " ", ""]
+)
+chunks = text_splitter.split_documents(documentos)
+
+# 1. Configurando os modelos do Google
+embeddings_gemini = GoogleGenerativeAIEmbeddings(
+    model="models/gemini-embedding-001",
+    google_api_key=key
+)
+
+# 2. Vetorização e Armazenamento
+vectorstore = Chroma.from_documents(
+    documents=chunks,
+    embedding=embeddings_gemini,
+    collection_name=f"meu_projeto_{uuid.uuid4().hex[:8]}"
+)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+llm_gemini = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, google_api_key=key)
+
+# 3. Função de comparação
+def comparar_metodos(pergunta):
+    # --- MODO 1: SEM RAG (Apenas o conhecimento prévio do modelo) ---
+    resposta_sem_rag = llm_gemini.invoke(pergunta)
+
+    # --- MODO 2: COM RAG ---
+    docs_recuperados = retriever.invoke(pergunta)
+    contexto_formatado = "\n".join([f"TRECHO {i}: {d.page_content}" for i, d in enumerate(docs_recuperados)])
+
+    prompt_rag = ChatPromptTemplate.from_template("""
+    Você é um assistente que responde APENAS com base no contexto abaixo.
+    Se a informação não estiver no contexto, diga que não encontrou no texto.
+
+    CONTEXTO:
+    {context}
+
+    PERGUNTA: {question}
+    """)
+
+    # Passamos o llm_gemini para a chain
+    chain = prompt_rag | llm_gemini
+    resposta_com_rag = chain.invoke({"context": contexto_formatado, "question": pergunta})
+
+    # --- EXIBIÇÃO DOS RESULTADOS ---
+    print(f"\n PERGUNTA: {pergunta}")
+    print("-" * 30)
+    print(f" SEM RAG (Memória do Modelo):\n{resposta_sem_rag.content}")
+    print("-" * 30)
+    print(f" COM RAG (Ancorado no Texto):\n{resposta_com_rag.content}")
+    print("-" * 30)
+    print(f" CHUNKS RECUPERADOS: {len(docs_recuperados)} trechos utilizados.")
+    for i, doc in enumerate(docs_recuperados):
+      print(f"\n CHUNK UTILIZADO {i+1}:")
+      print(f"   Conteúdo: {doc.page_content}")
+      print(f"   Metadados: {doc.metadata}")
+      print("="*50)
+
+# Teste
+comparar_metodos("De acordo com o Código de Ética Profissional, quais são as condições em que um profissional tem o direito de recusar ou interromper um trabalho, contrato ou emprego?")
